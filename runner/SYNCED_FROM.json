@@ -1,0 +1,5 @@
+{
+  "source": "parasync_sandbox/runner.py",
+  "commit": "81a9a249acd9719e602a934cbfec10a4166939f2",
+  "note": "runner.py is a verbatim copy. Re-sync with: python3 scripts/sync_harness.py ../parasync_sandbox"
+}

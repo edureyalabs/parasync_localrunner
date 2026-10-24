@@ -1,0 +1,18 @@
+# image/requirements.txt
+# The packages every script can import without installing anything: the same baseline the cloud sandbox image ships
+# (parasync_sandbox/microvm/requirements.txt), minus what only the cloud needs (the web framework and the browser).
+# If the cloud's list changes, mirror it here so scripts see the same libraries in both places.
+numpy
+pandas
+requests
+python-dateutil
+pytz
+PyYAML
+beautifulsoup4
+lxml
+openpyxl
+pydantic
+jsonschema
+python-docx
+reportlab
+pypdf
