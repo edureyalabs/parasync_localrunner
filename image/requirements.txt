@@ -14,5 +14,6 @@ openpyxl
 pydantic
 jsonschema
 python-docx
-reportlab
+# Pinned: newer reportlab refuses to import on Python 3.9 ("requires 3.10+") even though pip installs it there.
+reportlab==4.2.5
 pypdf
