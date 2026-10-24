@@ -21,7 +21,8 @@ pytestmark = pytest.mark.skipif(bool(MISSING), reason=f"baseline libraries not i
 @pytest.mark.parametrize("module", LIBRARIES)
 def test_baseline_library_imports_in_a_script(module: str) -> None:
     out = run({"mode": "script", "code": f"import {module}\nresult = '{module}'"})
-    assert out["ok"] is True and out["result"] == module
+    assert out["ok"] is True, out
+    assert out["result"] == module
 
 
 def test_a_spreadsheet_round_trip_works() -> None:
