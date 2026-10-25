@@ -102,3 +102,18 @@ def test_garbage_input_gets_a_clear_refusal() -> None:
 def test_exactly_one_result_line_even_when_the_script_is_noisy() -> None:
     out = run({"mode": "script", "code": "import sys\nfor i in range(200):\n    print('noise', i)\n    print('err', i, file=sys.stderr)\nresult = 'done'"})
     assert out["ok"] is True and out["result"] == "done"
+
+
+def test_pip_installs_are_held_to_the_versions_this_python_can_import(tmp_path):
+    import run_job
+
+    env: dict = {}
+    run_job.apply_pip_constraints(env)
+    assert env["PIP_CONSTRAINT"].endswith("constraints.txt") and os.path.exists(env["PIP_CONSTRAINT"])
+    assert "reportlab==4.2.5" in open(env["PIP_CONSTRAINT"]).read()
+    mine = {"PIP_CONSTRAINT": "/elsewhere.txt"}
+    run_job.apply_pip_constraints(mine)
+    assert mine["PIP_CONSTRAINT"] == "/elsewhere.txt"            # an explicit setting is respected
+    none: dict = {}
+    run_job.apply_pip_constraints(none, path=str(tmp_path / "missing.txt"))
+    assert none == {}

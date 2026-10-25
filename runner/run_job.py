@@ -14,12 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 from runner import execute
 
 MARKER = "__PARASYNC_JOB_RESULT__"
 MODES = {"function", "script"}
+CONSTRAINTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "constraints.txt")
+
+
+def apply_pip_constraints(environ: dict | os._Environ = os.environ, path: str = CONSTRAINTS) -> None:
+    """A script that installs a package (the job's `packages`) may not move a library past the version this box's Python can import."""
+    if os.path.exists(path):
+        environ.setdefault("PIP_CONSTRAINT", path)
 
 
 def emit(result: dict) -> None:
@@ -49,6 +57,7 @@ def validate(job: object) -> str | None:
 
 
 def main() -> int:
+    apply_pip_constraints()
     try:
         job = json.loads(sys.stdin.buffer.read())
     except (json.JSONDecodeError, UnicodeDecodeError):

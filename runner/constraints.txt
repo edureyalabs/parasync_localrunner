@@ -1,0 +1,4 @@
+# runner/constraints.txt
+# Versions a script's own `pip install` may never move past on this box's Python 3.9. pip reads this through PIP_CONSTRAINT (set by run_job.py).
+# reportlab 4.3+ installs fine on 3.9 but then refuses to import ("requires 3.10+"); seen on a real PC 2026-10-25 when a script installed it unpinned.
+reportlab==4.2.5

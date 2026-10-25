@@ -21,6 +21,12 @@ An "exec" outcome has the same shape the cloud's /browser/exec returns: {"ok", "
 An exec script runs here with `browser`, `context` and `page` pre-bound (the synchronous Playwright API, exactly like the cloud harness) and a
 `result` variable is returned if it is JSON-serialisable. Files the script writes into the working folder come back as output_files (new or changed
 since before the call). The process exits when the app closes the pipe, on "close", or after IDLE_SECONDS without a request.
+
+A script that runs past its time limit is stopped by a signal, and that signal can land inside Playwright's own plumbing and leave the whole
+connection dead (page.title() then never answers again; found on real PCs 2026-10-25, where every later call burned its full time limit until
+the agent closed the browser). So after a timeout the host checks the browser with a real round trip, and when it is dead it replaces it in
+place: a new Chromium with the same cookies and local storage, back on the page it was on. The session survives and stays signed in; only the
+page's unsaved state is lost, and the timed-out call's answer says so.
 """
 from __future__ import annotations
 
@@ -32,6 +38,7 @@ import os
 import select
 import signal
 import sys
+import threading
 import traceback
 from contextlib import contextmanager
 from typing import Any, Callable, IO
@@ -42,6 +49,11 @@ DEFAULT_EXEC_TIMEOUT = 120
 MAX_EXEC_TIMEOUT = 600
 WORK_ROOT = os.environ.get("PARASYNC_BROWSER_WORK_ROOT", "/tmp/parasync-browser")
 CHROMIUM_ARGS = ["--disable-dev-shm-usage", "--disable-gpu"]
+
+
+STOP_GRACE_SECONDS = 5
+PROBE_SECONDS = 5
+RELOAD_TIMEOUT_MS = 12_000   # probe 5 s + close 5 s + start ~3 s + this = inside the app's 30 s grace after a script's own limit
 
 
 class ExecTimeout(BaseException):
@@ -70,6 +82,39 @@ def _safe_join(root: str, rel: str) -> str | None:
     """A staged file must stay inside the working folder."""
     full = os.path.normpath(os.path.join(root, rel))
     return full if full == root or full.startswith(root + os.sep) else None
+
+
+def _descendants(pid: int) -> list[int]:
+    """Every process below `pid` (found in /proc; no extra package). The browser driver and Chromium are among them."""
+    children: dict[int, list[int]] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as handle:
+                ppid = int(handle.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(name))
+    found: list[int] = []
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
+def _kill_descendants() -> None:
+    for pid in reversed(_descendants(os.getpid())):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 @contextmanager
@@ -104,28 +149,76 @@ def _environment(extra: dict[str, str]):
 class Session:
     """The browser, its one context and its first page, plus the working folder scripts run in."""
 
-    def __init__(self, session_id: str, launcher: Callable[[], tuple[Any, Any, Any, Callable[[], None]]]):
+    def __init__(self, session_id: str, launcher: Callable[..., tuple[Any, Any, Any, Callable[[], None]]]):
         self.session_id = session_id
+        self.launcher = launcher
         self.workdir = os.path.join(WORK_ROOT, session_id, "work")
         os.makedirs(self.workdir, exist_ok=True)
         os.chdir(self.workdir)
+        self.state: dict | None = None      # cookies and local storage as of the last call that left the browser healthy (memory only)
+        self.last_url: str | None = None
         self.browser, self.context, self.page, self._stop = launcher()
 
     def stop(self) -> None:
-        try:
-            self._stop()
-        except Exception:
-            pass
+        self._abandon()
+
+    def _abandon(self) -> None:
+        """Closes the browser, and kills whatever is left of it when closing does not work (a dead connection cannot close anything)."""
+        closed = {"ok": False}
+
+        def close() -> None:
+            try:
+                self._stop()
+                closed["ok"] = True
+            except BaseException:
+                pass
+
+        worker = threading.Thread(target=close, daemon=True)
+        worker.start()
+        worker.join(STOP_GRACE_SECONDS)
+        if not closed["ok"]:
+            _kill_descendants()
 
     def alive(self) -> bool:
-        """A cheap call that fails when the browser or the Playwright connection is broken."""
+        """A real round trip to the page. Reading `page.url` or `context.pages` is not one: Playwright keeps those in memory, so they still
+        answer after the connection to Chromium is dead."""
         try:
-            with _time_limit(8):
-                _ = self.context.pages
-                _ = self.page.url
+            with _time_limit(PROBE_SECONDS):
+                self.page.evaluate("1")
             return True
         except BaseException:
             return False
+
+    def remember(self) -> None:
+        """Keeps the login and the page address, so a browser that has to be replaced can come back where it was."""
+        try:
+            with _time_limit(PROBE_SECONDS):
+                self.state = self.context.storage_state()
+                self.last_url = self.page.url
+        except BaseException:
+            pass
+
+    def recover(self) -> str:
+        """Replaces a browser that stopped answering. Returns what to tell the caller; raises when no new browser can be started."""
+        url = self.last_url
+        self._abandon()
+        if self.state is not None:
+            self.browser, self.context, self.page, self._stop = self.launcher(storage_state=self.state)
+        else:
+            self.browser, self.context, self.page, self._stop = self.launcher()
+        if url and url.startswith(("http://", "https://")):
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=RELOAD_TIMEOUT_MS)
+                return (
+                    f"The browser had stopped responding, so it was restarted. You are still signed in (cookies and local storage kept) "
+                    f"and the page was reloaded at {url}; anything on the page that was not saved is gone, and `page` is the new tab."
+                )
+            except Exception:
+                return (
+                    f"The browser had stopped responding, so it was restarted. You are still signed in (cookies and local storage kept) "
+                    f"but the page could not be reloaded; go to {url} again."
+                )
+        return "The browser had stopped responding, so it was restarted (it is on a blank tab)."
 
     def execute(self, code: str, files: dict[str, str], env_vars: dict[str, str], timeout: float) -> dict:
         for rel, b64 in (files or {}).items():
@@ -204,7 +297,7 @@ class LineReader:
         return line + b"\n"
 
 
-def serve(session_id: str, launcher: Callable[[], tuple[Any, Any, Any, Callable[[], None]]], stdin: IO[bytes] | None = None, stdout: IO[str] | None = None, idle_seconds: float = IDLE_SECONDS) -> int:
+def serve(session_id: str, launcher: Callable[..., tuple[Any, Any, Any, Callable[[], None]]], stdin: IO[bytes] | None = None, stdout: IO[str] | None = None, idle_seconds: float = IDLE_SECONDS) -> int:
     out = stdout or sys.stdout
     source = LineReader((stdin or sys.stdin.buffer).fileno())
     try:
@@ -237,19 +330,29 @@ def serve(session_id: str, launcher: Callable[[], tuple[Any, Any, Any, Callable[
                 continue
             timeout = float(min(max(request.get("timeout") or DEFAULT_EXEC_TIMEOUT, 1), MAX_EXEC_TIMEOUT))
             outcome = session.execute(request["code"], request.get("files") or {}, request.get("env_vars") or {}, timeout)
-            if outcome.pop("timed_out", False) and not session.alive():
-                # The time limit interrupted Playwright mid-call and left it unusable: say so instead of limping on.
-                emit(out, {"type": "response", "id": rid, "outcome": outcome})
-                emit(out, {"type": "fatal", "error": "the browser stopped responding after a timeout and was closed"})
-                return 0
-            outcome.pop("timed_out", None)
+            if outcome.pop("timed_out", False):
+                if not session.alive():
+                    # The time limit interrupted Playwright mid-call and left it unusable. Replace the browser (same login, same page)
+                    # instead of leaving a session that answers nothing; only when that fails too is the session over.
+                    try:
+                        outcome["error"] = f"{outcome.get('error', 'browser script timed out')}. {session.recover()}"
+                        outcome["browser_restarted"] = True
+                    except BaseException as exc:
+                        emit(out, {"type": "response", "id": rid, "outcome": outcome})
+                        emit(out, {"type": "fatal", "error": f"the browser stopped responding after a timeout and could not be restarted: {type(exc).__name__}: {exc}"})
+                        return 0
+                else:
+                    session.remember()
+            else:
+                session.remember()
             emit(out, {"type": "response", "id": rid, "outcome": outcome})
     finally:
         session.stop()
 
 
-def playwright_launcher() -> tuple[Any, Any, Any, Callable[[], None]]:
-    """The real launcher: synchronous Playwright, headless Chromium, an in-memory profile."""
+def playwright_launcher(storage_state: dict | None = None) -> tuple[Any, Any, Any, Callable[[], None]]:
+    """The real launcher: synchronous Playwright, headless Chromium, an in-memory profile (`storage_state`: the cookies and local storage of
+    the browser this one replaces)."""
     # WSL does not carry the image's Docker ENV into the running system, so say where the browser lives.
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
     from playwright.sync_api import sync_playwright
@@ -257,7 +360,7 @@ def playwright_launcher() -> tuple[Any, Any, Any, Callable[[], None]]:
     pw = sync_playwright().start()
     try:
         browser = pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
-        context = browser.new_context(accept_downloads=True)
+        context = browser.new_context(accept_downloads=True, storage_state=storage_state) if storage_state else browser.new_context(accept_downloads=True)
         page = context.new_page()
     except BaseException:
         pw.stop()

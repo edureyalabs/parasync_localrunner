@@ -23,9 +23,18 @@ class FakePage:
     def title(self) -> str:
         return "blank"
 
+    def evaluate(self, _js: str) -> int:
+        return 1
+
+    def goto(self, url: str, **_kwargs) -> None:
+        self.url = url
+
 
 class FakeContext:
     pages = [FakePage()]
+
+    def storage_state(self) -> dict:
+        return {"cookies": [{"name": "sid", "value": "abc"}], "origins": []}
 
 
 class FakeBrowser:
@@ -40,6 +49,8 @@ def fake_launcher():
 @pytest.fixture(autouse=True)
 def workroot(tmp_path, monkeypatch):
     monkeypatch.setattr(bh, "WORK_ROOT", str(tmp_path))
+    killed = []
+    monkeypatch.setattr(bh, "_kill_descendants", lambda: killed.append(True))   # never kill the test runner's own children
     cwd = os.getcwd()
     yield tmp_path
     os.chdir(cwd)
@@ -118,19 +129,92 @@ def test_the_time_limit_stops_a_script_that_swallows_exceptions():
     assert outcome(lines, "2")["result"] == "still here"     # the fake browser is fine, so the session continues
 
 
-def test_a_timeout_that_breaks_the_browser_closes_the_session():
-    class Broken(FakeContext):
-        @property
-        def pages(self):
-            raise RuntimeError("driver gone")
+class DeadPage(FakePage):
+    """What a page looks like after a timeout left Playwright's connection dead: cached attributes still answer, a real call never does."""
 
-    def launcher():
-        return FakeBrowser(), Broken(), FakePage(), lambda: None
+    def evaluate(self, _js: str) -> int:
+        raise RuntimeError("driver gone")
 
-    lines = run_session([{"id": "1", "op": "exec", "timeout": 1, "code": "while True:\n    pass"},
-                         {"id": "2", "op": "exec", "code": "result = 1"}], launcher=launcher)
-    assert any(m.get("type") == "fatal" for m in lines)
+
+class Launches:
+    """A launcher that hands out a dead browser first, then healthy ones, and remembers how it was called."""
+
+    def __init__(self, fail_after_first: bool = False):
+        self.calls: list[dict | None] = []
+        self.fail_after_first = fail_after_first
+        self.stopped = 0
+        self.pages: list[FakePage] = []
+
+    def __call__(self, storage_state: dict | None = None):
+        self.calls.append(storage_state)
+        if len(self.calls) > 1 and self.fail_after_first:
+            raise RuntimeError("no chromium")
+        page = DeadPage() if len(self.calls) == 1 else FakePage()
+        page.url = "https://site.example/erp/list" if len(self.calls) == 1 else "about:blank"
+        self.pages.append(page)
+
+        def stop() -> None:
+            self.stopped += 1
+
+        return FakeBrowser(), FakeContext(), page, stop
+
+
+def test_a_timeout_that_breaks_the_browser_replaces_it_and_the_session_goes_on():
+    launcher = Launches()
+    lines = run_session([
+        {"id": "1", "op": "exec", "code": "result = 1"},
+        {"id": "2", "op": "exec", "timeout": 1, "code": "while True:\n    pass"},
+        {"id": "3", "op": "exec", "code": "result = page.url"},
+    ], launcher=launcher)
+    # the first call worked on the dead browser (fake page), then the timeout was followed by a real health check that failed
+    second = outcome(lines, "2")
+    assert second["ok"] is False and second["browser_restarted"] is True
+    assert "timed out" in second["error"] and "restarted" in second["error"] and "still signed in" in second["error"]
+    assert len(launcher.calls) == 2 and launcher.calls[1] == {"cookies": [{"name": "sid", "value": "abc"}], "origins": []}   # cookies carried over
+    assert launcher.stopped >= 1                                                                                            # the old one was closed
+    assert "https://site.example/erp/list" in second["error"]                                                              # and told where it was
+    assert outcome(lines, "3")["ok"] is True                                                                                # the session is usable again
+    assert not any(m.get("type") == "fatal" for m in lines)
+
+
+def test_a_timeout_that_breaks_the_browser_for_good_ends_the_session():
+    launcher = Launches(fail_after_first=True)
+    lines = run_session([
+        {"id": "1", "op": "exec", "timeout": 1, "code": "while True:\n    pass"},
+        {"id": "2", "op": "exec", "code": "result = 1"},
+    ], launcher=launcher)
+    fatal = next(m for m in lines if m.get("type") == "fatal")
+    assert "could not be restarted" in fatal["error"] and "no chromium" in fatal["error"]
+    assert "timed out" in outcome(lines, "1")["error"]           # the caller still gets the answer to its own call
     assert not any(m.get("id") == "2" for m in lines)
+
+
+def test_a_dead_browser_is_found_by_ping_not_by_cached_attributes():
+    launcher = Launches()
+    lines = run_session([{"id": "1", "op": "ping"}], launcher=launcher)
+    assert outcome(lines, "1") == {"ok": False}      # page.url still answered; only a real round trip shows it is dead
+
+
+def test_a_healthy_browser_after_a_timeout_is_kept_and_not_restarted():
+    launcher_calls = []
+
+    def launcher(storage_state=None):
+        launcher_calls.append(storage_state)
+        return FakeBrowser(), FakeContext(), FakePage(), lambda: None
+
+    lines = run_session([{"id": "1", "op": "exec", "timeout": 1, "code": "while True:\n    pass"}, {"id": "2", "op": "exec", "code": "result = 1"}], launcher=launcher)
+    assert "browser_restarted" not in outcome(lines, "1") and "restarted" not in outcome(lines, "1")["error"]
+    assert len(launcher_calls) == 1 and outcome(lines, "2")["ok"] is True
+
+
+def test_descendants_are_found_from_proc():
+    import subprocess
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        assert child.pid in bh._descendants(os.getpid())
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_non_json_result_ping_bad_request_and_close():
