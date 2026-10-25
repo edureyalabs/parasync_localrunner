@@ -54,4 +54,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "${TAG}" dist/* --title "${TAG#v}" --notes "Parasync local runner ${TAG#v} (Linux environment for WSL2)"
+          # Works whether the release was already drafted by hand in the GitHub page or does not exist yet.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            gh release create "${TAG}" dist/* --title "${TAG#v}" --notes "Parasync local runner ${TAG#v} (Linux environment for WSL2)" --latest
+          fi
