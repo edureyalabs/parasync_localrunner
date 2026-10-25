@@ -17,3 +17,6 @@ python-docx
 # Pinned: newer reportlab refuses to import on Python 3.9 ("requires 3.10+") even though pip installs it there.
 reportlab==4.2.5
 pypdf
+# Browser sessions (image 0.2.0). The cloud installs the latest; this one is pinned to a release that supports Python 3.9 and whose Chromium
+# build exists for Debian bookworm. The Chromium download itself is the `playwright install` line in the Dockerfile.
+playwright==1.49.1

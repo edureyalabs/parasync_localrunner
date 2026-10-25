@@ -22,6 +22,13 @@ RUN apt-get update \
 COPY image/requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
+# Browser sessions (image 0.2.0): Chromium for Playwright, with the system libraries it needs, installed once here and readable by the
+# unprivileged user. WSL does not carry Docker's ENV into the exported system, so browser_host.py sets PLAYWRIGHT_BROWSERS_PATH itself.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN python3 -m playwright install --with-deps chromium \
+ && chmod -R a+rX /opt/pw-browsers \
+ && rm -rf /var/lib/apt/lists/*
+
 # The one program the desktop app starts for each job, and the harness it uses (a copy of the cloud's, see scripts/sync_harness.py).
 COPY runner/ /opt/runner/
 COPY VERSION /etc/parasync-runner-version
