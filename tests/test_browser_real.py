@@ -32,7 +32,9 @@ def _chromium_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _chromium_available(), reason="Playwright with Chromium is not installed here")
+# CI sets PARASYNC_REQUIRE_BROWSER=1 inside the built image: there a missing browser is a FAILURE, never a quiet skip.
+REQUIRED = os.environ.get("PARASYNC_REQUIRE_BROWSER") == "1"
+pytestmark = pytest.mark.skipif(not REQUIRED and not _chromium_available(), reason="Playwright with Chromium is not installed here")
 
 
 def test_a_session_keeps_its_page_between_scripts_and_returns_a_screenshot(tmp_path):

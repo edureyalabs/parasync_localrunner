@@ -35,7 +35,7 @@ jobs:
       - name: Run the tests inside the built environment
         run: |
           VERSION="$(cat VERSION)"
-          docker run --rm --user root -v "$PWD:/w" -w /w "parasync-runner:${VERSION}" sh -c "pip install -q pytest && python3 -m pytest -q tests"
+          docker run --rm --user root -e PARASYNC_REQUIRE_BROWSER=1 -v "$PWD:/w" -w /w "parasync-runner:${VERSION}" sh -c "pip install -q pytest && python3 -m pytest -q -rs tests"
 
       - name: The sealed-room settings are in place
         run: |
