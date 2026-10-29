@@ -219,7 +219,8 @@ async def serve_async(session_id: str, chromium_factory: Callable[[str, str], An
     core = None
     try:
         try:
-            chromium = chromium_factory(session_id, workdir)
+            # Off the event loop: finding Chromium asks Playwright's synchronous API, which refuses to run inside a running loop, and starting it waits seconds.
+            chromium = await loop.run_in_executor(None, chromium_factory, session_id, workdir)
             core = core_factory(workdir, chromium.cdp_url)
         except Exception as exc:
             emit(out, {"type": "fatal", "error": "the browser could not be started: %s: %s" % (type(exc).__name__, exc)})

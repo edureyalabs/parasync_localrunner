@@ -159,6 +159,24 @@ def test_close_answers_and_stops_the_browser():
     assert outcome(lines, "1") == {"ok": True} and not any(m.get("id") == "2" for m in lines) and code == 0 and chromium.stopped == 1
 
 
+def test_chromium_is_started_off_the_event_loop():
+    """Playwright's synchronous API (used to find Chromium) refuses to run inside a running asyncio loop: it failed in CI inside the real image."""
+    import asyncio
+
+    seen = []
+
+    def factory(sid, wd):
+        try:
+            asyncio.get_running_loop()
+            seen.append("in the loop")
+        except RuntimeError:
+            seen.append("off the loop")
+        return FakeChromium()
+
+    lines, _code, _c, _core = run_session([], chromium_factory=factory)
+    assert seen == ["off the loop"] and lines[0]["type"] == "ready"
+
+
 def test_a_start_failure_is_one_fatal_line():
     def broken(sid, wd):
         raise RuntimeError("no chromium here")
