@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: '3.9'
       - run: python -m pip install pytest
+      - name: The cloud browser copies were not edited by hand
+        run: python scripts/sync_browser.py --check
       - run: python -m pytest -q tests
 
   image:

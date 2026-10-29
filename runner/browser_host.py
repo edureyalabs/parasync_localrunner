@@ -4,60 +4,52 @@ One browser session = one process of this program, kept alive by the desktop app
 
     wsl.exe -d ParasyncRunner -u root --exec sh -c '<lock interop>; exec runuser -u runner -- ... python3 /opt/runner/browser_host.py <session_id>'
 
-It launches headless Chromium once (an in-memory profile, nothing is written to disk) and then answers requests the app writes to its standard
-input, one JSON object per line. Nothing listens on a port: Playwright talks to Chromium over a pipe, and the app talks to this program over
-stdin/stdout, so no other program on the PC can attach to the browser.
+It starts headless Chromium once, on a free port of this box's loopback address, and then answers the requests the app writes to its standard input, one
+JSON object per line. Everything a request does is browser_core.py, a verbatim copy of the cloud's (scripts/sync_browser.py): a script runs in its own process
+against that Chromium, `look` describes the page, `act` does one move and reports what it caused, and the resident watcher (senses.py) records the network,
+console, dialogs, tabs and downloads between calls. So a browser here behaves like a browser in the cloud MicroVM. What is this file's own: starting and
+stopping Chromium, the line protocol, the session's lifetime.
+
+The debugging port is the price of that sameness. It is chosen at random per session, bound to 127.0.0.1 of the box, and exists only while the session does.
 
 Requests (stdin), each a single line:
   {"id": "...", "op": "exec", "code": "...", "files": {"rel/path": "<base64>"}, "env_vars": {...}, "timeout": 120}
+  {"id": "...", "op": "look", ...the cloud's /browser/look body...}
+  {"id": "...", "op": "act", "action": "click", ...the cloud's /browser/act body...}
   {"id": "...", "op": "ping"}
   {"id": "...", "op": "close"}
 Replies (stdout), each a single line starting with the marker so that anything else printed is ignored:
-  __PARASYNC_BROWSER__{"type": "ready"}
+  __PARASYNC_BROWSER__{"type": "ready", "senses": true}
   __PARASYNC_BROWSER__{"type": "response", "id": "...", "outcome": {...}}
   __PARASYNC_BROWSER__{"type": "fatal", "error": "..."}            (then the process exits)
-An "exec" outcome has the same shape the cloud's /browser/exec returns: {"ok", "result" | "error", "stdout", "output_files": {path: base64}}.
-
-An exec script runs here with `browser`, `context` and `page` pre-bound (the synchronous Playwright API, exactly like the cloud harness) and a
-`result` variable is returned if it is JSON-serialisable. Files the script writes into the working folder come back as output_files (new or changed
-since before the call). The process exits when the app closes the pipe, on "close", or after IDLE_SECONDS without a request.
-
-A script that runs past its time limit is stopped by a signal, and that signal can land inside Playwright's own plumbing and leave the whole
-connection dead (page.title() then never answers again; found on real PCs 2026-10-25, where every later call burned its full time limit until
-the agent closed the browser). So after a timeout the host checks the browser with a real round trip, and when it is dead it replaces it in
-place: a new Chromium with the same cookies and local storage, back on the page it was on. The session survives and stays signed in; only the
-page's unsaved state is lost, and the timed-out call's answer says so.
+An outcome has the shape the cloud endpoint returns: exec {"ok", "result" | "error", "stdout", "output_files", "senses"}, look and act {"ok", "report", "page",
+"settled", ..., "output_files"}. The process exits when the app closes the pipe, on "close", when Chromium dies, or after IDLE_SECONDS without a request.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import io
+import asyncio
 import json
 import os
-import select
+import shutil
 import signal
+import socket
+import subprocess
 import sys
+import tempfile
 import threading
+import time
 import traceback
-from contextlib import contextmanager
-from typing import Any, Callable, IO
+import urllib.request
+from typing import IO, Any, Callable, Optional
 
 MARKER = "__PARASYNC_BROWSER__"
 IDLE_SECONDS = 45 * 60
 DEFAULT_EXEC_TIMEOUT = 120
 MAX_EXEC_TIMEOUT = 600
+START_SECONDS = 40
 WORK_ROOT = os.environ.get("PARASYNC_BROWSER_WORK_ROOT", "/tmp/parasync-browser")
-CHROMIUM_ARGS = ["--disable-dev-shm-usage", "--disable-gpu"]
-
-
+CHROMIUM_ARGS = ["--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-first-run", "--no-default-browser-check"]
 STOP_GRACE_SECONDS = 5
-PROBE_SECONDS = 5
-RELOAD_TIMEOUT_MS = 12_000   # probe 5 s + close 5 s + start ~3 s + this = inside the app's 30 s grace after a script's own limit
-
-
-class ExecTimeout(BaseException):
-    """BaseException on purpose: a script's own `except Exception:` must not swallow the time limit."""
 
 
 def emit(out: IO[str], message: dict) -> None:
@@ -65,28 +57,11 @@ def emit(out: IO[str], message: dict) -> None:
     out.flush()
 
 
-def _hash_tree(root: str) -> dict[str, str]:
-    hashes: dict[str, str] = {}
-    for folder, _dirs, names in os.walk(root):
-        for name in names:
-            path = os.path.join(folder, name)
-            try:
-                with open(path, "rb") as handle:
-                    hashes[os.path.relpath(path, root).replace(os.sep, "/")] = hashlib.sha256(handle.read()).hexdigest()
-            except OSError:
-                continue
-    return hashes
+# ── Chromium ─────────────────────────────────────────────────────────────────
 
-
-def _safe_join(root: str, rel: str) -> str | None:
-    """A staged file must stay inside the working folder."""
-    full = os.path.normpath(os.path.join(root, rel))
-    return full if full == root or full.startswith(root + os.sep) else None
-
-
-def _descendants(pid: int) -> list[int]:
-    """Every process below `pid` (found in /proc; no extra package). The browser driver and Chromium are among them."""
-    children: dict[int, list[int]] = {}
+def _descendants(pid: int) -> list:
+    """Every process below `pid` (found in /proc; no extra package)."""
+    children: dict = {}
     try:
         names = os.listdir("/proc")
     except OSError:
@@ -95,12 +70,12 @@ def _descendants(pid: int) -> list[int]:
         if not name.isdigit():
             continue
         try:
-            with open(f"/proc/{name}/stat") as handle:
+            with open("/proc/%s/stat" % name) as handle:
                 ppid = int(handle.read().rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             continue
         children.setdefault(ppid, []).append(int(name))
-    found: list[int] = []
+    found: list = []
     stack = [pid]
     while stack:
         for child in children.get(stack.pop(), []):
@@ -109,270 +84,193 @@ def _descendants(pid: int) -> list[int]:
     return found
 
 
-def _kill_descendants() -> None:
-    for pid in reversed(_descendants(os.getpid())):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
-@contextmanager
-def _time_limit(seconds: float):
-    def on_alarm(_signum, _frame):
-        raise ExecTimeout()
+class Chromium:
+    """A Chromium process of its own with a remote-debugging port on loopback and a throw-away profile folder."""
 
-    previous = signal.signal(signal.SIGALRM, on_alarm)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+    def __init__(self, executable: str, profile: str, port: Optional[int] = None) -> None:
+        self.port = port or _free_port()
+        self.profile = profile
+        self.cdp_url = "http://127.0.0.1:%d" % self.port
+        os.makedirs(profile, exist_ok=True)
+        args = [executable, *CHROMIUM_ARGS, "--remote-debugging-port=%d" % self.port, "--remote-debugging-address=127.0.0.1", "--user-data-dir=" + profile, "about:blank"]
+        self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-
-@contextmanager
-def _environment(extra: dict[str, str]):
-    """The call's own variables (the broker URL and token) exist only while the script runs."""
-    previous = {key: os.environ.get(key) for key in extra}
-    os.environ.update({str(k): str(v) for k, v in extra.items()})
-    try:
-        yield
-    finally:
-        for key, old in previous.items():
-            if old is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = old
-
-
-class Session:
-    """The browser, its one context and its first page, plus the working folder scripts run in."""
-
-    def __init__(self, session_id: str, launcher: Callable[..., tuple[Any, Any, Any, Callable[[], None]]]):
-        self.session_id = session_id
-        self.launcher = launcher
-        self.workdir = os.path.join(WORK_ROOT, session_id, "work")
-        os.makedirs(self.workdir, exist_ok=True)
-        os.chdir(self.workdir)
-        self.state: dict | None = None      # cookies and local storage as of the last call that left the browser healthy (memory only)
-        self.last_url: str | None = None
-        self.browser, self.context, self.page, self._stop = launcher()
-
-    def stop(self) -> None:
-        self._abandon()
-
-    def _abandon(self) -> None:
-        """Closes the browser, and kills whatever is left of it when closing does not work (a dead connection cannot close anything)."""
-        closed = {"ok": False}
-
-        def close() -> None:
+    def wait_ready(self, seconds: float = START_SECONDS) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("Chromium exited while starting (code %s)" % self.proc.returncode)
             try:
-                self._stop()
-                closed["ok"] = True
-            except BaseException:
-                pass
-
-        worker = threading.Thread(target=close, daemon=True)
-        worker.start()
-        worker.join(STOP_GRACE_SECONDS)
-        if not closed["ok"]:
-            _kill_descendants()
+                urllib.request.urlopen(self.cdp_url + "/json/version", timeout=1)
+                return
+            except Exception:
+                time.sleep(0.15)
+        raise RuntimeError("Chromium did not answer on its debugging port in %ds" % int(seconds))
 
     def alive(self) -> bool:
-        """A real round trip to the page. Reading `page.url` or `context.pages` is not one: Playwright keeps those in memory, so they still
-        answer after the connection to Chromium is dead."""
+        """A real round trip, not just 'the process exists': a hung Chromium does not answer."""
+        if self.proc.poll() is not None:
+            return False
         try:
-            with _time_limit(PROBE_SECONDS):
-                self.page.evaluate("1")
+            urllib.request.urlopen(self.cdp_url + "/json/version", timeout=3)
             return True
-        except BaseException:
+        except Exception:
             return False
 
-    def remember(self) -> None:
-        """Keeps the login and the page address, so a browser that has to be replaced can come back where it was."""
+    def stop(self) -> None:
+        below = _descendants(self.proc.pid)
         try:
-            with _time_limit(PROBE_SECONDS):
-                self.state = self.context.storage_state()
-                self.last_url = self.page.url
-        except BaseException:
-            pass
-
-    def recover(self) -> str:
-        """Replaces a browser that stopped answering. Returns what to tell the caller; raises when no new browser can be started."""
-        url = self.last_url
-        self._abandon()
-        if self.state is not None:
-            self.browser, self.context, self.page, self._stop = self.launcher(storage_state=self.state)
-        else:
-            self.browser, self.context, self.page, self._stop = self.launcher()
-        if url and url.startswith(("http://", "https://")):
+            self.proc.terminate()
+            self.proc.wait(STOP_GRACE_SECONDS)
+        except Exception:
             try:
-                self.page.goto(url, wait_until="domcontentloaded", timeout=RELOAD_TIMEOUT_MS)
-                return (
-                    f"The browser had stopped responding, so it was restarted. You are still signed in (cookies and local storage kept) "
-                    f"and the page was reloaded at {url}; anything on the page that was not saved is gone, and `page` is the new tab."
-                )
+                self.proc.kill()
             except Exception:
-                return (
-                    f"The browser had stopped responding, so it was restarted. You are still signed in (cookies and local storage kept) "
-                    f"but the page could not be reloaded; go to {url} again."
-                )
-        return "The browser had stopped responding, so it was restarted (it is on a blank tab)."
-
-    def execute(self, code: str, files: dict[str, str], env_vars: dict[str, str], timeout: float) -> dict:
-        for rel, b64 in (files or {}).items():
-            dest = _safe_join(self.workdir, rel)
-            if dest is None:
-                return {"ok": False, "error": f"refused a file path outside the working folder: {rel}", "stdout": "", "output_files": {}}
-            os.makedirs(os.path.dirname(dest) or self.workdir, exist_ok=True)
-            with open(dest, "wb") as handle:
-                handle.write(base64.b64decode(b64))
-        before = _hash_tree(self.workdir)
-
-        namespace: dict[str, Any] = {"browser": self.browser, "context": self.context, "page": self.page}
-        captured = io.StringIO()
-        real_stdout, real_stderr = sys.stdout, sys.stderr
-        outcome: dict[str, Any]
-        timed_out = False
-        sys.stdout = sys.stderr = captured
-        try:
-            with _environment(env_vars or {}), _time_limit(timeout):
-                exec(compile(code, "<browser_script>", "exec"), namespace)
-            if "result" in namespace:
-                try:
-                    json.dumps(namespace["result"])
-                    outcome = {"ok": True, "result": namespace["result"]}
-                except TypeError:
-                    outcome = {"ok": False, "error": "`result` is not JSON-serializable"}
-            else:
-                outcome = {"ok": True, "result": None}
-        except ExecTimeout:
-            timed_out = True
-            outcome = {"ok": False, "error": f"browser script timed out after {int(timeout)}s and was stopped"}
-        except SystemExit:
-            outcome = {"ok": False, "error": "the script called exit()"}
-        except Exception as exc:
-            outcome = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        finally:
-            sys.stdout, sys.stderr = real_stdout, real_stderr
-
-        outcome["stdout"] = captured.getvalue()
-        after = _hash_tree(self.workdir)
-        output_files: dict[str, str] = {}
-        for rel, digest in after.items():
-            if before.get(rel) == digest:
-                continue
-            with open(os.path.join(self.workdir, rel), "rb") as handle:
-                output_files[rel] = base64.b64encode(handle.read()).decode()
-        outcome["output_files"] = output_files
-        outcome["timed_out"] = timed_out
-        return outcome
+                pass
+        for pid in reversed(below):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(self.profile, ignore_errors=True)
 
 
-class LineReader:
-    """Lines from a file descriptor with a time limit. Unbuffered on purpose: select() on a buffered Python reader can miss lines that
-    already sit in its buffer, which would strand a request that arrived together with another one."""
+def real_chromium(session_id: str, workdir: str) -> Chromium:
+    """The real thing: the Chromium Playwright installed in this box (/opt/pw-browsers), started and waited for."""
+    # WSL does not carry the image's Docker ENV into the running system, so say where the browser lives.
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
+    from playwright.sync_api import sync_playwright
 
-    def __init__(self, fd: int):
-        self.fd = fd
-        self.buffer = b""
-        self.eof = False
-
-    def readline(self, timeout: float) -> bytes | None:
-        """A line, b"" at end of input, or None when nothing arrived within `timeout` seconds."""
-        while b"\n" not in self.buffer:
-            if self.eof:
-                rest, self.buffer = self.buffer, b""
-                return rest
-            ready, _, _ = select.select([self.fd], [], [], timeout)
-            if not ready:
-                return None
-            chunk = os.read(self.fd, 1 << 20)
-            if not chunk:
-                self.eof = True
-                continue
-            self.buffer += chunk
-        line, self.buffer = self.buffer.split(b"\n", 1)
-        return line + b"\n"
-
-
-def serve(session_id: str, launcher: Callable[..., tuple[Any, Any, Any, Callable[[], None]]], stdin: IO[bytes] | None = None, stdout: IO[str] | None = None, idle_seconds: float = IDLE_SECONDS) -> int:
-    out = stdout or sys.stdout
-    source = LineReader((stdin or sys.stdin.buffer).fileno())
+    executable = os.environ.get("PARASYNC_CHROMIUM_PATH") or ""          # a development / test override; a PC always uses the one Playwright installed
+    if not executable:
+        with sync_playwright() as pw:
+            executable = pw.chromium.executable_path
+    chromium = Chromium(executable, os.path.join(WORK_ROOT, session_id, "profile"))
     try:
-        session = Session(session_id, launcher)
-    except Exception as exc:
-        emit(out, {"type": "fatal", "error": f"the browser could not be started: {type(exc).__name__}: {exc}"})
-        return 1
-    emit(out, {"type": "ready"})
+        chromium.wait_ready()
+    except BaseException:
+        chromium.stop()
+        raise
+    return chromium
+
+
+def real_core(workdir: str, cdp_url: str) -> Any:
+    from browser_core import BrowserCore
+
+    return BrowserCore(workdir, cdp_url, DEFAULT_EXEC_TIMEOUT, python=sys.executable or "python3")
+
+
+# ── the line protocol ────────────────────────────────────────────────────────
+
+def _read_lines(stdin: IO[bytes], loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue") -> None:
+    """Runs in a thread: one queue item per line, None at the end of input. Quiet when the session is already over (the loop is closed)."""
+    def post(item: Any) -> bool:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+            return True
+        except RuntimeError:
+            return False
+
     try:
         while True:
-            line = source.readline(idle_seconds)
-            if line is None:
+            line = stdin.readline()
+            if not line or not post(line):
+                break
+    except Exception:
+        pass
+    post(None)
+
+
+async def _handle(core: Any, request: dict) -> dict:
+    op = request.get("op")
+    if op == "exec":
+        code = request.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return {"ok": False, "error": "bad request"}
+        try:
+            wanted = float(request.get("timeout") or DEFAULT_EXEC_TIMEOUT)
+        except (TypeError, ValueError):
+            wanted = float(DEFAULT_EXEC_TIMEOUT)
+        timeout = float(min(max(wanted, 1), MAX_EXEC_TIMEOUT))
+        return await core.run_script(code, request.get("files") or {}, request.get("env_vars") or {}, timeout)
+    body = {k: v for k, v in request.items() if k not in ("id", "op")}
+    if op == "look":
+        return await core.look(body)
+    if op == "act":
+        return await core.act(body)
+    return {"ok": False, "error": "bad request"}
+
+
+async def serve_async(session_id: str, chromium_factory: Callable[[str, str], Any], core_factory: Callable[[str, str], Any],
+                      stdin: IO[bytes], out: IO[str], idle_seconds: float = IDLE_SECONDS) -> int:
+    workdir = os.path.join(WORK_ROOT, session_id, "work")
+    os.makedirs(workdir, exist_ok=True)
+    os.chdir(workdir)
+    loop = asyncio.get_event_loop()
+    chromium = None
+    core = None
+    try:
+        try:
+            chromium = chromium_factory(session_id, workdir)
+            core = core_factory(workdir, chromium.cdp_url)
+        except Exception as exc:
+            emit(out, {"type": "fatal", "error": "the browser could not be started: %s: %s" % (type(exc).__name__, exc)})
+            return 1
+        queue: "asyncio.Queue" = asyncio.Queue()
+        threading.Thread(target=_read_lines, args=(stdin, loop, queue), daemon=True).start()
+        emit(out, {"type": "ready", "senses": True})
+        while True:
+            try:
+                line = await asyncio.wait_for(queue.get(), idle_seconds)
+            except asyncio.TimeoutError:
                 emit(out, {"type": "fatal", "error": "the browser session was idle for too long and was closed"})
                 return 0
-            if not line:
+            if line is None:
                 return 0                      # the app closed the pipe (quit, crash, sign-out): the browser goes with it
             try:
                 request = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
+            if not isinstance(request, dict):
+                continue
             op, rid = request.get("op"), request.get("id")
             if op == "close":
                 emit(out, {"type": "response", "id": rid, "outcome": {"ok": True}})
                 return 0
+            alive = chromium.alive()
             if op == "ping":
-                emit(out, {"type": "response", "id": rid, "outcome": {"ok": session.alive()}})
+                emit(out, {"type": "response", "id": rid, "outcome": {"ok": alive}})
                 continue
-            if op != "exec" or not isinstance(request.get("code"), str) or not request["code"].strip():
-                emit(out, {"type": "response", "id": rid, "outcome": {"ok": False, "error": "bad request"}})
-                continue
-            timeout = float(min(max(request.get("timeout") or DEFAULT_EXEC_TIMEOUT, 1), MAX_EXEC_TIMEOUT))
-            outcome = session.execute(request["code"], request.get("files") or {}, request.get("env_vars") or {}, timeout)
-            if outcome.pop("timed_out", False):
-                if not session.alive():
-                    # The time limit interrupted Playwright mid-call and left it unusable. Replace the browser (same login, same page)
-                    # instead of leaving a session that answers nothing; only when that fails too is the session over.
-                    try:
-                        outcome["error"] = f"{outcome.get('error', 'browser script timed out')}. {session.recover()}"
-                        outcome["browser_restarted"] = True
-                    except BaseException as exc:
-                        emit(out, {"type": "response", "id": rid, "outcome": outcome})
-                        emit(out, {"type": "fatal", "error": f"the browser stopped responding after a timeout and could not be restarted: {type(exc).__name__}: {exc}"})
-                        return 0
-                else:
-                    session.remember()
-            else:
-                session.remember()
+            if not alive:
+                emit(out, {"type": "response", "id": rid, "outcome": {"ok": False, "error": "the browser stopped responding", "stdout": "", "output_files": {}}})
+                emit(out, {"type": "fatal", "error": "the browser stopped responding and the session ended"})
+                return 0
+            try:
+                outcome = await _handle(core, request)
+            except Exception as exc:
+                outcome = {"ok": False, "error": "%s: %s" % (type(exc).__name__, str(exc)[:300]), "stdout": "", "output_files": {}}
             emit(out, {"type": "response", "id": rid, "outcome": outcome})
     finally:
-        session.stop()
+        if core is not None:
+            try:
+                await core.senses._teardown()
+            except Exception:
+                pass
+        if chromium is not None:
+            chromium.stop()
 
 
-def playwright_launcher(storage_state: dict | None = None) -> tuple[Any, Any, Any, Callable[[], None]]:
-    """The real launcher: synchronous Playwright, headless Chromium, an in-memory profile (`storage_state`: the cookies and local storage of
-    the browser this one replaces)."""
-    # WSL does not carry the image's Docker ENV into the running system, so say where the browser lives.
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
-    from playwright.sync_api import sync_playwright
-
-    pw = sync_playwright().start()
-    try:
-        browser = pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
-        context = browser.new_context(accept_downloads=True, storage_state=storage_state) if storage_state else browser.new_context(accept_downloads=True)
-        page = context.new_page()
-    except BaseException:
-        pw.stop()
-        raise
-
-    def stop() -> None:
-        try:
-            browser.close()
-        finally:
-            pw.stop()
-
-    return browser, context, page, stop
+def serve(session_id: str, chromium_factory: Callable[[str, str], Any] = real_chromium, core_factory: Callable[[str, str], Any] = real_core,
+          stdin: Optional[IO[bytes]] = None, stdout: Optional[IO[str]] = None, idle_seconds: float = IDLE_SECONDS) -> int:
+    return asyncio.run(serve_async(session_id, chromium_factory, core_factory, stdin or sys.stdin.buffer, stdout or sys.stdout, idle_seconds))
 
 
 def main() -> int:
@@ -383,7 +281,7 @@ def main() -> int:
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8")
     os.dup2(2, 1)
     try:
-        return serve(sys.argv[1], playwright_launcher, stdout=protocol)
+        return serve(sys.argv[1], stdout=protocol)
     except Exception:
         emit(protocol, {"type": "fatal", "error": traceback.format_exc(limit=3)})
         return 1

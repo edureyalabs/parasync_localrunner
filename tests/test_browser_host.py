@@ -1,15 +1,17 @@
 # tests/test_browser_host.py
 """
-The browser host's protocol and script semantics, with a fake browser (no Chromium needed): ready/response lines, results, output files,
-per-call variables, the time limit that scripts cannot swallow, path safety, close/EOF/idle exits, and a launch failure.
+The browser host's protocol and lifetime, with a fake Chromium and a fake core (no browser needed): ready/response lines, what each op passes on to the
+shared core, time-limit clamping, ping, a Chromium that dies, bad requests, close / end of input / idle exits, a start failure, a core that raises,
+and how the real Chromium is started (loopback address, its own profile folder, a random port) without starting it. What a request really DOES in a
+browser is the cloud's own code and is tested against a real Chromium in tests/test_browser_real.py and in parasync_sandbox.
 """
 from __future__ import annotations
 
-import base64
 import io
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -17,198 +19,172 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "runner"))
 import browser_host as bh  # noqa: E402
 
 
-class FakePage:
-    url = "about:blank"
+class FakeSenses:
+    def __init__(self):
+        self.torn_down = False
 
-    def title(self) -> str:
-        return "blank"
-
-    def evaluate(self, _js: str) -> int:
-        return 1
-
-    def goto(self, url: str, **_kwargs) -> None:
-        self.url = url
+    async def _teardown(self):
+        self.torn_down = True
 
 
-class FakeContext:
-    pages = [FakePage()]
+class FakeCore:
+    def __init__(self):
+        self.calls = []
+        self.senses = FakeSenses()
+        self.explode = False
 
-    def storage_state(self) -> dict:
-        return {"cookies": [{"name": "sid", "value": "abc"}], "origins": []}
+    async def run_script(self, code, files, env_vars, timeout):
+        self.calls.append(("exec", code, files, env_vars, timeout))
+        if self.explode:
+            raise RuntimeError("boom")
+        return {"ok": True, "result": code.upper(), "stdout": "", "output_files": {}, "senses": {"console": []}}
+
+    async def look(self, body):
+        self.calls.append(("look", body))
+        return {"ok": True, "report": "PAGE x", "output_files": {}}
+
+    async def act(self, body):
+        self.calls.append(("act", body))
+        return {"ok": True, "report": "clicked", "output_files": {}}
 
 
-class FakeBrowser:
-    pass
+class FakeChromium:
+    cdp_url = "http://127.0.0.1:1"
 
+    def __init__(self):
+        self.up = True
+        self.stopped = 0
 
-def fake_launcher():
-    stopped = []
-    return FakeBrowser(), FakeContext(), FakePage(), lambda: stopped.append(True)
+    def alive(self):
+        return self.up
+
+    def stop(self):
+        self.stopped += 1
 
 
 @pytest.fixture(autouse=True)
 def workroot(tmp_path, monkeypatch):
     monkeypatch.setattr(bh, "WORK_ROOT", str(tmp_path))
-    killed = []
-    monkeypatch.setattr(bh, "_kill_descendants", lambda: killed.append(True))   # never kill the test runner's own children
     cwd = os.getcwd()
     yield tmp_path
     os.chdir(cwd)
 
 
-def run_session(requests: list[dict], launcher=fake_launcher, idle_seconds: float = 5) -> list[dict]:
+def run_session(requests: list, chromium=None, core=None, idle_seconds: float = 5, chromium_factory=None):
+    chromium = chromium or FakeChromium()
+    core = core or FakeCore()
     r, w = os.pipe()
     with os.fdopen(w, "wb") as writer:
         for request in requests:
             writer.write((json.dumps(request) + "\n").encode())
     out = io.StringIO()
     with os.fdopen(r, "rb") as reader:
-        code = bh.serve("sess1", launcher, stdin=reader, stdout=out, idle_seconds=idle_seconds)
+        code = bh.serve("sess1", chromium_factory or (lambda sid, wd: chromium), lambda wd, url: core, stdin=reader, stdout=out, idle_seconds=idle_seconds)
     lines = [json.loads(line[len(bh.MARKER):]) for line in out.getvalue().splitlines() if line.startswith(bh.MARKER)]
-    lines.append({"type": "exit", "code": code})
-    return lines
+    return lines, code, chromium, core
 
 
-def outcome(lines: list[dict], rid: str) -> dict:
+def outcome(lines: list, rid: str) -> dict:
     return next(m["outcome"] for m in lines if m.get("id") == rid)
 
 
-def test_ready_then_a_result_from_the_page():
-    lines = run_session([{"id": "1", "op": "exec", "code": "result = page.url + ' ' + page.title()"}])
-    assert lines[0] == {"type": "ready"}
-    assert outcome(lines, "1") == {"ok": True, "result": "about:blank blank", "stdout": "", "output_files": {}}
-    assert lines[-1] == {"type": "exit", "code": 0}      # the pipe closed: the session ends
+def test_ready_says_the_senses_are_there_and_the_end_of_input_ends_the_session_and_the_browser():
+    lines, code, chromium, core = run_session([])
+    assert lines == [{"type": "ready", "senses": True}] and code == 0
+    assert chromium.stopped == 1 and core.senses.torn_down                    # the browser goes with the app's pipe
 
 
-def test_printed_text_is_returned_and_never_corrupts_the_protocol():
-    lines = run_session([{"id": "1", "op": "exec", "code": "print('hello'); result = 1"}])
-    assert outcome(lines, "1")["stdout"] == "hello\n"
-    assert all(m.get("type") in {"ready", "response", "exit"} for m in lines)
-
-
-def test_a_script_error_is_reported_without_ending_the_session():
-    lines = run_session([
-        {"id": "1", "op": "exec", "code": "raise ValueError('nope')"},
-        {"id": "2", "op": "exec", "code": "result = 2"},
+def test_exec_look_and_act_go_to_the_shared_core_with_what_the_app_sent():
+    lines, _code, _c, core = run_session([
+        {"id": "1", "op": "exec", "code": "page.url", "files": {"a.txt": "eA=="}, "env_vars": {"K": "v"}, "timeout": 30},
+        {"id": "2", "op": "look", "query": "search", "allowed_hosts": ["erp.test"], "id_ignored": 1},
+        {"id": "3", "op": "act", "action": "click", "target": "k3x.1", "settle_ms": 100},
     ])
-    assert outcome(lines, "1")["ok"] is False and "ValueError: nope" in outcome(lines, "1")["error"]
-    assert outcome(lines, "2")["result"] == 2
+    assert outcome(lines, "1")["result"] == "PAGE.URL" and outcome(lines, "1")["senses"] == {"console": []}
+    assert outcome(lines, "2")["report"] == "PAGE x" and outcome(lines, "3")["report"] == "clicked"
+    assert core.calls[0] == ("exec", "page.url", {"a.txt": "eA=="}, {"K": "v"}, 30.0)
+    assert core.calls[1] == ("look", {"query": "search", "allowed_hosts": ["erp.test"], "id_ignored": 1})          # the id and op are the protocol's, not the body
+    assert core.calls[2] == ("act", {"action": "click", "target": "k3x.1", "settle_ms": 100})
 
 
-def test_files_in_and_new_or_changed_files_out(workroot):
-    data = base64.b64encode(b"abc").decode()
-    lines = run_session([
-        {"id": "1", "op": "exec", "files": {"in/a.txt": data},
-         "code": "open('out.txt','w').write(open('in/a.txt').read().upper())\nresult = 'ok'"},
-        {"id": "2", "op": "exec", "code": "result = 'again'"},
-    ])
-    first = outcome(lines, "1")
-    assert base64.b64decode(first["output_files"]["out.txt"]) == b"ABC"
-    assert "in/a.txt" not in first["output_files"]          # staged inputs are not outputs
-    assert outcome(lines, "2")["output_files"] == {}        # unchanged files are not repeated
+def test_the_time_limit_is_clamped_and_defaults():
+    lines, _c, _ch, core = run_session([{"id": "1", "op": "exec", "code": "x", "timeout": 99999}, {"id": "2", "op": "exec", "code": "y"}, {"id": "3", "op": "exec", "code": "z", "timeout": "soon"},
+                                         {"id": "4", "op": "exec", "code": "w", "timeout": 0.01}])
+    assert [c[4] for c in core.calls] == [bh.MAX_EXEC_TIMEOUT, bh.DEFAULT_EXEC_TIMEOUT, bh.DEFAULT_EXEC_TIMEOUT, 1.0]
 
 
-def test_a_staged_file_cannot_escape_the_working_folder():
-    lines = run_session([{"id": "1", "op": "exec", "files": {"../../evil": base64.b64encode(b"x").decode()}, "code": "result = 1"}])
-    assert outcome(lines, "1")["ok"] is False and "outside the working folder" in outcome(lines, "1")["error"]
-
-
-def test_call_variables_exist_only_during_the_call():
-    lines = run_session([
-        {"id": "1", "op": "exec", "env_vars": {"PARASYNC_BROKER_TOKEN": "tok"}, "code": "import os\nresult = os.environ.get('PARASYNC_BROKER_TOKEN')"},
-        {"id": "2", "op": "exec", "code": "import os\nresult = os.environ.get('PARASYNC_BROKER_TOKEN')"},
-    ])
-    assert outcome(lines, "1")["result"] == "tok"
-    assert outcome(lines, "2")["result"] is None
-
-
-def test_the_time_limit_stops_a_script_that_swallows_exceptions():
-    code = "while True:\n    try:\n        pass\n    except Exception:\n        pass"
-    lines = run_session([{"id": "1", "op": "exec", "timeout": 1, "code": code}, {"id": "2", "op": "exec", "code": "result = 'still here'"}])
-    assert outcome(lines, "1")["ok"] is False and "timed out" in outcome(lines, "1")["error"]
-    assert outcome(lines, "2")["result"] == "still here"     # the fake browser is fine, so the session continues
-
-
-class DeadPage(FakePage):
-    """What a page looks like after a timeout left Playwright's connection dead: cached attributes still answer, a real call never does."""
-
-    def evaluate(self, _js: str) -> int:
-        raise RuntimeError("driver gone")
-
-
-class Launches:
-    """A launcher that hands out a dead browser first, then healthy ones, and remembers how it was called."""
-
-    def __init__(self, fail_after_first: bool = False):
-        self.calls: list[dict | None] = []
-        self.fail_after_first = fail_after_first
-        self.stopped = 0
-        self.pages: list[FakePage] = []
-
-    def __call__(self, storage_state: dict | None = None):
-        self.calls.append(storage_state)
-        if len(self.calls) > 1 and self.fail_after_first:
-            raise RuntimeError("no chromium")
-        page = DeadPage() if len(self.calls) == 1 else FakePage()
-        page.url = "https://site.example/erp/list" if len(self.calls) == 1 else "about:blank"
-        self.pages.append(page)
-
-        def stop() -> None:
-            self.stopped += 1
-
-        return FakeBrowser(), FakeContext(), page, stop
-
-
-def test_a_timeout_that_breaks_the_browser_replaces_it_and_the_session_goes_on():
-    launcher = Launches()
-    lines = run_session([
-        {"id": "1", "op": "exec", "code": "result = 1"},
-        {"id": "2", "op": "exec", "timeout": 1, "code": "while True:\n    pass"},
-        {"id": "3", "op": "exec", "code": "result = page.url"},
-    ], launcher=launcher)
-    # the first call worked on the dead browser (fake page), then the timeout was followed by a real health check that failed
-    second = outcome(lines, "2")
-    assert second["ok"] is False and second["browser_restarted"] is True
-    assert "timed out" in second["error"] and "restarted" in second["error"] and "still signed in" in second["error"]
-    assert len(launcher.calls) == 2 and launcher.calls[1] == {"cookies": [{"name": "sid", "value": "abc"}], "origins": []}   # cookies carried over
-    assert launcher.stopped >= 1                                                                                            # the old one was closed
-    assert "https://site.example/erp/list" in second["error"]                                                              # and told where it was
-    assert outcome(lines, "3")["ok"] is True                                                                                # the session is usable again
+def test_bad_requests_get_an_answer_and_do_not_end_the_session():
+    lines, _c, _ch, core = run_session([{"id": "1", "op": "exec", "code": "  "}, {"id": "2", "op": "fly"}, {"id": "3", "op": "exec"}, {"id": "4", "op": "exec", "code": "ok"}])
+    assert outcome(lines, "1") == {"ok": False, "error": "bad request"} and outcome(lines, "2") == {"ok": False, "error": "bad request"} and outcome(lines, "3")["error"] == "bad request"
+    assert outcome(lines, "4")["ok"] is True and len(core.calls) == 1
     assert not any(m.get("type") == "fatal" for m in lines)
 
 
-def test_a_timeout_that_breaks_the_browser_for_good_ends_the_session():
-    launcher = Launches(fail_after_first=True)
-    lines = run_session([
-        {"id": "1", "op": "exec", "timeout": 1, "code": "while True:\n    pass"},
-        {"id": "2", "op": "exec", "code": "result = 1"},
-    ], launcher=launcher)
-    fatal = next(m for m in lines if m.get("type") == "fatal")
-    assert "could not be restarted" in fatal["error"] and "no chromium" in fatal["error"]
-    assert "timed out" in outcome(lines, "1")["error"]           # the caller still gets the answer to its own call
-    assert not any(m.get("id") == "2" for m in lines)
+def test_garbage_lines_are_ignored():
+    r, w = os.pipe()
+    with os.fdopen(w, "wb") as writer:
+        writer.write(b"not json\n[1,2]\n" + (json.dumps({"id": "1", "op": "ping"}) + "\n").encode())
+    out = io.StringIO()
+    with os.fdopen(r, "rb") as reader:
+        bh.serve("s", lambda sid, wd: FakeChromium(), lambda wd, url: FakeCore(), stdin=reader, stdout=out, idle_seconds=5)
+    assert '"outcome": {"ok": true}' in out.getvalue()
 
 
-def test_a_dead_browser_is_found_by_ping_not_by_cached_attributes():
-    launcher = Launches()
-    lines = run_session([{"id": "1", "op": "ping"}], launcher=launcher)
-    assert outcome(lines, "1") == {"ok": False}      # page.url still answered; only a real round trip shows it is dead
+def test_ping_says_whether_chromium_answers():
+    lines, _c, chromium, _core = run_session([{"id": "1", "op": "ping"}])
+    assert outcome(lines, "1") == {"ok": True}
+    dead = FakeChromium()
+    dead.up = False
+    lines, code, _c, _core = run_session([{"id": "1", "op": "ping"}], chromium=dead)
+    assert outcome(lines, "1") == {"ok": False} and not any(m.get("type") == "fatal" for m in lines)
 
 
-def test_a_healthy_browser_after_a_timeout_is_kept_and_not_restarted():
-    launcher_calls = []
+def test_a_dead_chromium_ends_the_session_with_a_clear_answer_and_a_fatal_line():
+    dead = FakeChromium()
+    dead.up = False
+    lines, code, chromium, core = run_session([{"id": "1", "op": "exec", "code": "page.url"}], chromium=dead)
+    assert "stopped responding" in outcome(lines, "1")["error"] and lines[-1]["type"] == "fatal" and code == 0
+    assert core.calls == [] and chromium.stopped == 1
 
-    def launcher(storage_state=None):
-        launcher_calls.append(storage_state)
-        return FakeBrowser(), FakeContext(), FakePage(), lambda: None
 
-    lines = run_session([{"id": "1", "op": "exec", "timeout": 1, "code": "while True:\n    pass"}, {"id": "2", "op": "exec", "code": "result = 1"}], launcher=launcher)
-    assert "browser_restarted" not in outcome(lines, "1") and "restarted" not in outcome(lines, "1")["error"]
-    assert len(launcher_calls) == 1 and outcome(lines, "2")["ok"] is True
+def test_a_core_that_raises_is_an_answer_not_the_end():
+    core = FakeCore()
+    core.explode = True
+    lines, _c, _ch, _core = run_session([{"id": "1", "op": "exec", "code": "x"}, {"id": "2", "op": "ping"}], core=core)
+    assert outcome(lines, "1")["ok"] is False and "RuntimeError: boom" in outcome(lines, "1")["error"] and outcome(lines, "2") == {"ok": True}
+
+
+def test_close_answers_and_stops_the_browser():
+    lines, code, chromium, _core = run_session([{"id": "1", "op": "close"}, {"id": "2", "op": "exec", "code": "never"}])
+    assert outcome(lines, "1") == {"ok": True} and not any(m.get("id") == "2" for m in lines) and code == 0 and chromium.stopped == 1
+
+
+def test_a_start_failure_is_one_fatal_line():
+    def broken(sid, wd):
+        raise RuntimeError("no chromium here")
+
+    lines, code, _c, _core = run_session([], chromium_factory=broken)
+    assert len(lines) == 1 and lines[0]["type"] == "fatal" and "could not be started" in lines[0]["error"] and "no chromium here" in lines[0]["error"] and code == 1
+
+
+def test_an_idle_session_closes_itself():
+    r, w = os.pipe()                                          # nothing is ever written and the pipe stays open
+    out = io.StringIO()
+    chromium = FakeChromium()
+    reader = os.fdopen(r, "rb")
+    try:
+        code = bh.serve("idle1", lambda sid, wd: chromium, lambda wd, url: FakeCore(), stdin=reader, stdout=out, idle_seconds=0.3)
+    finally:
+        os.close(w)                                           # the reading thread sees the end and lets go of the reader before it is closed
+        time.sleep(0.2)
+        reader.close()
+    messages = [json.loads(line[len(bh.MARKER):]) for line in out.getvalue().splitlines() if line.startswith(bh.MARKER)]
+    assert code == 0 and messages[-1]["type"] == "fatal" and "idle" in messages[-1]["error"] and chromium.stopped == 1
 
 
 def test_descendants_are_found_from_proc():
     import subprocess
+
     child = subprocess.Popen(["sleep", "30"])
     try:
         assert child.pid in bh._descendants(os.getpid())
@@ -217,33 +193,20 @@ def test_descendants_are_found_from_proc():
         child.wait()
 
 
-def test_non_json_result_ping_bad_request_and_close():
-    lines = run_session([
-        {"id": "1", "op": "exec", "code": "result = object()"},
-        {"id": "2", "op": "ping"},
-        {"id": "3", "op": "exec", "code": "   "},
-        {"id": "4", "op": "close"},
-        {"id": "5", "op": "exec", "code": "result = 1"},
-    ])
-    assert "not JSON-serializable" in outcome(lines, "1")["error"]
-    assert outcome(lines, "2") == {"ok": True}
-    assert outcome(lines, "3")["error"] == "bad request"
-    assert outcome(lines, "4") == {"ok": True}
-    assert not any(m.get("id") == "5" for m in lines)        # nothing after close is answered
+def test_chromium_is_started_on_loopback_with_its_own_profile_and_a_random_port(monkeypatch, tmp_path):
+    started = []
 
+    class FakeProc:
+        pid = 99999
 
-def test_a_launch_failure_is_reported_as_fatal():
-    def launcher():
-        raise RuntimeError("no chromium")
+        def poll(self):
+            return None
 
-    lines = run_session([], launcher=launcher)
-    assert lines[0]["type"] == "fatal" and "no chromium" in lines[0]["error"]
-    assert lines[-1] == {"type": "exit", "code": 1}
-
-
-def test_an_idle_session_closes_itself():
-    r, w = os.pipe()
-    out = io.StringIO()
-    with os.fdopen(r, "rb") as reader, os.fdopen(w, "wb"):
-        code = bh.serve("sess1", fake_launcher, stdin=reader, stdout=out, idle_seconds=0.2)
-    assert code == 0 and "idle for too long" in out.getvalue()
+    monkeypatch.setattr(bh.subprocess, "Popen", lambda args, **kw: started.append((args, kw)) or FakeProc())
+    a = bh.Chromium("/x/chrome", str(tmp_path / "p1"))
+    b = bh.Chromium("/x/chrome", str(tmp_path / "p2"))
+    args = started[0][0]
+    assert args[0] == "/x/chrome" and "--remote-debugging-port=%d" % a.port in args and "--remote-debugging-address=127.0.0.1" in args
+    assert "--user-data-dir=" + str(tmp_path / "p1") in args and "--headless=new" in args and a.cdp_url == "http://127.0.0.1:%d" % a.port
+    assert started[0][1]["stdout"] == bh.subprocess.DEVNULL                   # nothing Chromium prints can reach the protocol channel
+    assert a.port != b.port and os.path.isdir(str(tmp_path / "p1"))

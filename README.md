@@ -7,8 +7,11 @@ The whole system (all four repos, routing, trust rules, releases, debugging) is 
 ## What it is
 - `runner/runner.py`: a verbatim copy of the cloud sandbox's harness (never edit by hand; `scripts/sync_harness.py` refreshes it and records the source commit in `runner/SYNCED_FROM.json`).
 - `runner/run_job.py`: the program the desktop app starts per code run. It reads one JSON job on stdin, runs it through the harness, and prints exactly one `__PARASYNC_JOB_RESULT__{json}` line on stdout.
-- `runner/browser_host.py` (image 0.2.0+): one process per browser session. Headless Chromium through synchronous Playwright (in-memory profile, no network port), driven by the app over stdin/stdout JSON lines
-  (`exec` / `ping` / `close` in, `__PARASYNC_BROWSER__{json}` lines out). Scripts see `browser`, `context`, `page` like the cloud harness.
+- `runner/browser_host.py` (image 0.2.0+; rebuilt on the cloud's browser code in 0.4.0): one process per browser session. It starts headless Chromium on a random loopback port of the box (throw-away
+  profile folder, removed when the session ends) and is driven by the app over stdin/stdout JSON lines (`exec` / `look` / `act` / `ping` / `close` in, `__PARASYNC_BROWSER__{json}` lines out).
+  What each request does is `browser_core.py`, `senses.py`, `driver.py`, `scrub.py`, `page_js.py` and `browser_harness.py`: **verbatim copies of `parasync_sandbox/microvm/`** (never edit them here;
+  `python3 scripts/sync_browser.py ../parasync_sandbox` brings a change over, `--check` / `tests/test_synced_browser.py` catch a hand edit). So a browser on a PC has the cloud's `look` and `act`, the
+  resident watcher (network, console, dialogs, tabs, downloads), scrubbing, files handed back once, and scripts that run in their own process (a script that overruns is killed alone; the browser keeps its page and login).
 - `runner/job_supervisor.py` + `runner/local_broker.py` (image 0.3.0+): how a job that was given secrets is started. The supervisor stays root, keeps the secrets in its own memory,
   runs the broker on 127.0.0.1 and starts the script as the unprivileged user with only the broker's address and a one-time token. The script can ask the broker to make an https request
   with a secret in it (only to that secret's own hosts, only to public addresses) and gets the answer back with the value blanked; it can never read the value. See `parasync_desktop/docs/LOCAL_SECRETS.md`.
@@ -33,4 +36,4 @@ Bump `VERSION`, push to `main`, wait for CI to go green, then on GitHub create a
 The repository must stay public (the app downloads without credentials). Installed apps pick the new image up themselves (checked every 6 h, applied when idle).
 
 ## Versions
-Bump `VERSION` when the image or harness changes. Move Python (here and in the cloud sandbox) together, never one. 0.1.0: code runs. 0.2.0: browsers. 0.3.0: the local broker (secrets kept away from the script).
+Bump `VERSION` when the image or harness changes. Move Python (here and in the cloud sandbox) together, never one. 0.1.0: code runs. 0.2.0: browsers. 0.3.0: the local broker (secrets kept away from the script). 0.4.0: browsers run the cloud's browser code (look, act, events, scrubbing).

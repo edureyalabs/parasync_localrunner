@@ -1,0 +1,13 @@
+{
+  "source": "parasync_sandbox/microvm",
+  "commit": "985c85ae4ed432f844a34f9d47e51d16fd4c1859",
+  "note": "Verbatim copies. Never edit them here. Re-sync with: python3 scripts/sync_browser.py ../parasync_sandbox",
+  "files": {
+    "browser_core.py": "bba9dd937354393bf42ba582d65a8493332bc3caf49a961aa490e94e29d317b2",
+    "senses.py": "e8a309878fcaf78242abe1fdb61b670fe696dc1f423ef4ff7672467866556151",
+    "driver.py": "3aac11eaba7652c777693fc9129ace990819f8f2297cb4d3222e8272e5defa89",
+    "scrub.py": "53b0ed353250069e5be36799255dbeb423599d3419b5266756dbdfcee153aa0a",
+    "page_js.py": "761342653af4649b2b7d79b26db7d47278c22faa41787a2555734a2a4ee3122e",
+    "browser_harness.py": "9198a757a5ccf13bb1820058c3e24824b0e2fe9295acf02fd76e3b0ffef357b4"
+  }
+}
